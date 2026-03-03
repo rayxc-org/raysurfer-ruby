@@ -164,66 +164,68 @@ module Raysurfer
       uri = URI.parse("#{@base_url}#{path}")
       attempt = 0
 
-      begin
-        http = Net::HTTP.new(uri.host, uri.port)
-        http.use_ssl = (uri.scheme == "https")
-        http.open_timeout = @timeout
-        http.read_timeout = @timeout
+      loop do
+        begin
+          http = Net::HTTP.new(uri.host, uri.port)
+          http.use_ssl = (uri.scheme == "https")
+          http.open_timeout = @timeout
+          http.read_timeout = @timeout
 
-        req_class = request_class_for!(method)
-        req = req_class.new(uri)
+          req_class = request_class_for!(method)
+          req = req_class.new(uri)
 
-        default_headers.merge(headers || {}).each do |key, value|
-          req[key] = value
-        end
+          default_headers.merge(headers || {}).each do |key, value|
+            req[key] = value
+          end
 
-        req.body = JSON.generate(body) unless body.nil?
+          req.body = JSON.generate(body) unless body.nil?
 
-        response = http.request(req)
-        status = response.code.to_i
-        parsed = parse_response_json(response.body)
+          response = http.request(req)
+          status = response.code.to_i
+          parsed = parse_response_json(response.body)
 
-        if status == 401
-          raise AuthenticationError.new(
-            "Invalid or missing API key. Set RAYSURFER_API_KEY or pass api_key. Docs: https://docs.raysurfer.com/quickstart",
-            status_code: status,
-            details: parsed
+          if status == 401
+            raise AuthenticationError.new(
+              "Invalid or missing API key. Set RAYSURFER_API_KEY or pass api_key. Docs: https://docs.raysurfer.com/quickstart",
+              status_code: status,
+              details: parsed
+            )
+          end
+
+          if RETRYABLE_STATUS_CODES.include?(status) && attempt < (MAX_RETRIES - 1)
+            sleep(backoff_delay(attempt, retry_after_seconds(response)))
+            attempt += 1
+            next
+          end
+
+          if status == 429
+            retry_after = retry_after_seconds(response)
+            raise RateLimitError.new(
+              "Rate limited by Raysurfer API.",
+              retry_after: retry_after,
+              status_code: status,
+              details: parsed
+            )
+          end
+
+          if status >= 400
+            message = parsed.is_a?(Hash) && parsed["detail"] ? parsed["detail"].to_s : "API request failed"
+            raise APIError.new(message, status_code: status, details: parsed)
+          end
+
+          return parsed
+        rescue Net::OpenTimeout, Net::ReadTimeout, Timeout::Error, Errno::ECONNREFUSED, Errno::ETIMEDOUT, EOFError, SocketError => e
+          if attempt < (MAX_RETRIES - 1)
+            sleep(backoff_delay(attempt, nil))
+            attempt += 1
+            next
+          end
+
+          raise CacheUnavailableError.new(
+            "Failed to connect to Raysurfer after #{MAX_RETRIES} attempts: #{e.class}: #{e.message}",
+            details: { method: method, path: path }
           )
         end
-
-        if RETRYABLE_STATUS_CODES.include?(status) && attempt < (MAX_RETRIES - 1)
-          sleep(backoff_delay(attempt, retry_after_seconds(response)))
-          attempt += 1
-          retry
-        end
-
-        if status == 429
-          retry_after = retry_after_seconds(response)
-          raise RateLimitError.new(
-            "Rate limited by Raysurfer API.",
-            retry_after: retry_after,
-            status_code: status,
-            details: parsed
-          )
-        end
-
-        if status >= 400
-          message = parsed.is_a?(Hash) && parsed["detail"] ? parsed["detail"].to_s : "API request failed"
-          raise APIError.new(message, status_code: status, details: parsed)
-        end
-
-        parsed
-      rescue Net::OpenTimeout, Net::ReadTimeout, Timeout::Error, Errno::ECONNREFUSED, Errno::ETIMEDOUT, EOFError, SocketError => e
-        if attempt < (MAX_RETRIES - 1)
-          sleep(backoff_delay(attempt, nil))
-          attempt += 1
-          retry
-        end
-
-        raise CacheUnavailableError.new(
-          "Failed to connect to Raysurfer after #{MAX_RETRIES} attempts: #{e.class}: #{e.message}",
-          details: { method: method, path: path }
-        )
       end
     end
 
